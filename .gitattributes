@@ -1,0 +1,4 @@
+# Normalize line endings in the repo to LF; checkout as-is.
+# (Stops the LF/CRLF warning noise on Windows.)
+* text=auto
+*.cmd text eol=crlf

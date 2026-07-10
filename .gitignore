@@ -1,0 +1,6 @@
+*.exe
+*.o
+*.obj
+research/*.csv
+research/*.png
+research/collect_log.txt
