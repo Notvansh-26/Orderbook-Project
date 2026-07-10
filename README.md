@@ -138,7 +138,7 @@ run_feed.cmd btcusdt
 - [x] Consume real market data (live Binance L2 depth feed)
 - [x] Terminal "ladder" visualization of the live book
 - [x] Top-of-book recording + imbalance research study
-- [ ] Replace `map`/`list` with cache-friendly structures (price-indexed
+- [x] Replace `map`/`list` with cache-friendly structures (price-indexed
       array of levels, intrusive lists, object pools) and measure the delta
 - [ ] Order modify (cancel-replace) with correct queue-priority semantics
 - [ ] IOC / FOK / post-only order types
