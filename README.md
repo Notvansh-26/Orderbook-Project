@@ -31,35 +31,70 @@ levels, so they get their own structure.
 
 ## Design
 
+Two interchangeable implementations of the same engine, tested against
+each other by one templated suite:
+
+**`order_book.hpp`** — the readable baseline:
+
 ```
 bids:  map<Price, list<Order>, greater<Price>>   // begin() = best bid
 asks:  map<Price, list<Order>, less<Price>>      // begin() = best ask
 index: unordered_map<OrderId, {side, price, list::iterator}>
 ```
 
+**`fast_order_book.hpp`** — the cache-friendly rewrite:
+
+```
+levels: vector<Level>            // indexed by price tick directly
+pool:   vector<Node>             // all orders, contiguous, free-listed
+index:  IdMap                    // open-addressing OrderId -> pool slot
+```
+
+A `Level` is just head/tail indices into an **intrusive doubly-linked
+FIFO**: the prev/next links live inside the 32-byte order nodes, which
+come from an **object pool** that recycles dead nodes (steady state does
+zero heap traffic). Finding a level is one indexed load instead of a
+red-black-tree walk; best-price cursors step linearly across the 8-byte
+levels when a level empties — near the touch the next occupied level is
+1–2 ticks away, and one cache line holds 8 levels. The trade-off: prices
+must live in a bounded tick band (real venues enforce price bands too).
+The id index (`id_map.hpp`) is a flat linear-probing hash map with
+backward-shift deletion — no per-entry heap nodes, no tombstones —
+because real flow is mostly add/cancel pairs hammering exactly that map.
+
+Shared semantics:
+
 - **Prices are integer ticks** — floating point is never used for money.
 - **Matching** walks the best opposite levels while the incoming order
   crosses, filling in FIFO (time-priority) order. Trades print at the
   *maker's* price.
-- **Cancels are O(1)** after the hash lookup: `std::list` iterators remain
-  valid under erasure of other elements, so the index can point straight
-  at the resting order. Real markets are mostly cancels, so this path
-  matters as much as matching.
-
-Complexity: add/match is O(log L) to locate a level (L = live price
-levels) plus O(1) per fill; cancel is O(1) amortized.
+- **Cancels are O(1)** after the hash lookup (stable `list` iterators in
+  the baseline, stable pool indices in the fast book). Real markets are
+  mostly cancels, so this path matters as much as matching.
+- **Cancel-replace** (`modify`): shrinking quantity at the same price
+  edits in place and *keeps queue priority*; a price change or size
+  increase re-enters at the back of the queue and may trade immediately.
+- **Time-in-force**: GTC, IOC (remainder discarded), FOK (all-or-nothing,
+  checked against crossable liquidity *before* executing, so a kill
+  leaves the book untouched), and post-only (rejected rather than ever
+  taking liquidity).
 
 ## Results
 
 1M simulated ops (55% limit adds near the touch, 40% cancels, 5% market
-orders, random-walking mid), single thread, `-O2`, MinGW GCC 6.3:
+orders, random-walking mid), single thread, `-O2`, MinGW GCC 6.3. Both
+books consume the identical seeded op stream in one run — same benchmark,
+same machine, back to back:
 
 ```
-throughput     : ~3.7M ops/sec
-latency p50    : 200 ns
-latency p99    : 700 ns
-latency p99.9  : 1.7 us
+                 OrderBook (map+list)    FastOrderBook (array+pool+IdMap)
+throughput       ~3.7M ops/sec           ~5.0M ops/sec   (~1.4x)
+latency p50      200 ns                  100 ns
+latency p99      700 ns                  400 ns
 ```
+
+Both books finish with an identical open-order count — a free cross-check
+that the rewrite matches the baseline's behavior op for op.
 
 Timing uses `QueryPerformanceCounter` on Windows — this toolchain's
 `std::chrono::high_resolution_clock` ticks at 15.6 ms, which silently
@@ -70,10 +105,14 @@ benchmark.
 
 `feed/binance_feed.py` implements Binance's documented depth-sync
 procedure (REST snapshot + diff stream stitched by update id, sequence-gap
-detection with automatic resync) and emits a normalized text protocol;
+detection with automatic resync), subscribes to the aggregate-trade stream
+on the same connection, and emits a normalized text protocol;
 `feed_consumer.exe` maintains the replica and reports top-of-book once per
-second. The consumer exits non-zero if the book ever crosses (bid >= ask),
-which would indicate a sync bug. Python (3.10+, `websockets`, `requests`)
+second. Each depth event ends with an explicit boundary marker, and the
+consumer only observes the book (logging, printing, cross detection) at
+boundaries — mid-event the replica can be transiently crossed without
+anything being wrong. The consumer exits non-zero if the book is crossed
+(bid >= ask) *at a boundary*, which would indicate a real sync bug. Python (3.10+, `websockets`, `requests`)
 handles TLS/websocket transport; C++ owns book maintenance.
 
 ```
@@ -105,18 +144,29 @@ feed pipeline itself, tails the consumer's flush-per-row CSV log, and
 redraws twice a second; close the window to shut everything down.
 `research/candles.py` renders static candles from a recorded session.
 
-## Research: order book imbalance
+## Research: order book imbalance & trade flow
 
-`run_feed.cmd btcusdt research\quotes.csv` records every top-of-book
-change. `research/imbalance_study.py` then tests whether top-of-book
-imbalance — `bid_qty / (bid_qty + ask_qty)` — predicts the direction of
-the mid-price move over the next N seconds: chronological 70/30
-train/test split, tail-threshold signals calibrated on train only,
-hit rates reported against the test-set base rate.
+`run_feed.cmd btcusdt research\quotes.csv research\trades.csv` records
+every top-of-book change plus every trade tagged with its **aggressor
+side** (who crossed the spread). Both CSVs share one monotonic clock, so
+they join on `ts_ns`. `research/imbalance_study.py` then evaluates two
+signals with the same methodology — chronological 70/30 train/test split,
+tail thresholds calibrated on train only, hit rates reported against the
+test-set base rate:
+
+- **book imbalance** `bid_qty / (bid_qty + ask_qty)` — who is *queued*;
+- **trade flow** (with `--trades`): net signed aggressor volume over a
+  trailing window, normalized to [-1, 1] — who is actually *trading*.
 
 ```
-python research/imbalance_study.py research/quotes.csv --horizon 5
+python research/imbalance_study.py research/quotes.csv --horizon 5 ^
+       --trades research/trades.csv --flow-window 10
 ```
+
+For results that aren't anecdotal, record a session of an hour or more:
+event-driven rows accumulate fast (a few thousand quote changes and
+hundreds of trades per minute on BTC/USDT), and short sessions are easily
+dominated by one directional move.
 
 Prices/quantities are parsed straight into 1e8-scaled `int64`
 (`src/fixed_point.hpp`) — market data never touches floating point.
@@ -140,7 +190,13 @@ run_feed.cmd btcusdt
 - [x] Top-of-book recording + imbalance research study
 - [x] Replace `map`/`list` with cache-friendly structures (price-indexed
       array of levels, intrusive lists, object pools) and measure the delta
-- [ ] Order modify (cancel-replace) with correct queue-priority semantics
-- [ ] IOC / FOK / post-only order types
-- [ ] Longer data collection sessions + trade-stream (aggressor) data for
-      the imbalance study
+      — `src/fast_order_book.hpp`: p50 200→100 ns, ~1.25x throughput
+- [x] Order modify (cancel-replace) with correct queue-priority semantics
+- [x] IOC / FOK / post-only order types
+- [x] Trade-stream (aggressor) data: recorded via `--trades`, evaluated as
+      a trailing-flow signal alongside book imbalance
+- [x] Custom open-addressing id→order map (`src/id_map.hpp`; linear
+      probing + backward-shift deletion; total delta now ~1.4x, p99
+      700→400 ns) — verified by a 200k-op differential fuzz that demands
+      identical behavior from both books at every step
+- [ ] Record a 1–2 hour session and re-run the study on it (in progress)
